@@ -1,0 +1,734 @@
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from android_utils import log, run_on_ui_thread
+from client_utils import run_on_queue, send_message, get_last_fragment, send_photo
+from markdown_utils import parse_markdown
+from org.telegram.messenger import ApplicationLoader
+from org.telegram.ui import ChatActivity
+from ui.bulletin import BulletinHelper
+from org.telegram.tgnet import TLRPC
+from java.util import ArrayList
+from ui.settings import Header, Switch, Input, Text, Divider, EditText
+from typing import List, Any
+import sys, io, traceback, threading, time
+from collections import Counter
+import os
+import tempfile
+from functools import partial
+from ui.alert import AlertDialogBuilder
+import json
+
+
+__id__ = "python_executor"
+__name__ = "Python Executor"
+__description__ = """Плагин позволяет выполнять Python-код прямо в чате.
+• .p <код> — выполнить код
+• .i <текст>/<ответ на сообщение> — ввод input()
+• .stop — прервать выполнение"""
+__version__ = "4.0.0"   
+__author__ = "samine825"
+__icon__ = "SiameseCatLive2/2"
+__min_version__ = "11.12.0"
+
+
+class RealtimeStdout:
+    def __init__(self, peer, send_code_block_func, plugin):
+        self.buffer = ""
+        self.peer = peer
+        self.send_code_block = send_code_block_func
+        self.plugin = plugin
+
+    @property
+    def max_output_length(self):
+        return int(self.plugin.get_setting("max_output_length", "4000") or 4000)
+
+    @property
+    def output_wrap(self):
+        return self.plugin.get_setting("output_wrap", "```PythonOutput\n{text}```")
+
+    def write(self, s: str):
+        if not s:
+            return 0
+        self.buffer += s
+        if self.buffer.endswith("\n"):
+            content = self.buffer[:-1]
+
+            if content != "":
+                if self.max_output_length:
+                    if len(content) > self.max_output_length:
+                        content = content[:self.max_output_length] + "\n… [вывод обрезан]"
+                parts = self.output_wrap.split("{text}", 1)
+                content = f"{parts[0]}{content}{parts[1]}" if content else self.output_wrap
+                self.send_code_block(content, self.peer)
+            self.buffer = ""
+        return len(s)
+
+    def flush(self):
+        if self.buffer:
+            content = self.buffer
+            if content.endswith("\n"):
+                content = content[:-1]
+            if content != "":
+                self.send_code_block(content, self.peer)
+            self.buffer = ""
+
+
+class PythonExecutorPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._init_globals()
+        self.current_collector = None
+        self.TIMER_SECONDS = 0.1
+
+        self.input_wait_event = None
+        self.input_result = None
+        self.log_buffer = []
+
+        self.stop_requested = threading.Event()
+        self.execution_thread = None
+        self.execution_lock = threading.Lock()
+
+        self.BIND_COUNT_KEY = "bind_count"
+        self.BIND_CMD_PREFIX = "bind_cmd_"
+        self.BIND_CODE_PREFIX = "bind_code_"
+
+    def _init_globals(self):
+        self.globals = {'__builtins__': __builtins__}
+        for m in ['sys']:
+            try:
+                self.globals[m] = __import__(m)
+            except:
+                pass
+        for name in dir(__builtins__):
+            if not name.startswith('_'):
+                self.globals[name] = getattr(__builtins__, name)
+        self.globals['application'] = ApplicationLoader.applicationContext
+
+    def _parse_arg_value(self, value: str):
+        value = value.strip()
+        if not value:
+            return value
+        lower = value.lower()
+        if lower in ('true', '1', 'yes', 'on'):
+            return True
+        if lower in ('false', '0', 'no', 'off'):
+            return False
+        if lower in ('none', 'null', 'nil'):
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            pass
+        try:
+            return float(value)
+        except ValueError:
+            pass
+        try:
+            return json.loads(value)
+        except:
+            pass
+        return value
+
+    def _parse_args(self, s: str) -> List[tuple[str, bool]]:
+        tokens = []
+        i = 0
+        n = len(s)
+        while i < n:
+            while i < n and s[i].isspace():
+                i += 1
+            if i >= n:
+                break
+            if s[i] in '"\'':
+                quote = s[i]
+                i += 1
+                start = i
+                while i < n and s[i] != quote:
+                    i += 1
+                if i >= n:
+                    raise ValueError("Unclosed quote")
+                token = s[start:i]
+                tokens.append((token, True))
+                i += 1  # skip closing quote
+            else:
+                start = i
+                while i < n and not s[i].isspace():
+                    i += 1
+                token = s[start:i]
+                tokens.append((token, False))
+        return tokens
+
+    def _detect_indent_size(self, code: str) -> int:
+        lines = [line for line in code.splitlines() if line.strip()]
+        indents = [len(line) - len(line.lstrip()) for line in lines if line.strip()]
+        if not indents:
+            return 4
+        most_common = Counter(indents).most_common(1)
+        return most_common[0][0] if most_common and most_common[0][0] > 0 else 4
+
+    def _log(self, text: str, level="INFO"):
+        ts = time.strftime("%H:%M:%S")
+        line = f"[{ts}] [{level}] {text}"
+        self.log_buffer.append(line)
+        log(line)
+
+    def _flush_logs(self, peer):
+        if not self.log_buffer or not peer:
+            return
+        text = "🛠 PyExec debug log:\n" + "\n".join(self.log_buffer[-60:])
+        if int(self.get_setting("max_log_length", 4000)):
+            if len(text) > int(self.get_setting("max_log_length", 4000)):
+                text = text[-int(self.get_setting("max_log_length", 4000)):] + "\n… [логи обрезаны]"
+        try:
+            send_message({"message": text, "peer": peer})
+        except:
+            pass
+        self.log_buffer.clear()
+
+    def _send_code_block(self, text: str, peer: Any):
+        if not text or not text.strip():
+            return
+        try:
+            clean_text = text.rstrip('\n')
+            parsed = parse_markdown(clean_text)
+            entities = []
+            for e in parsed.entities:
+                entities.append(e.to_tlrpc_object())
+            send_message({
+                "message": parsed.text,
+                "peer": peer,
+                "entities": entities
+            })
+        except Exception as ex:
+            self._log(f"Markdown code block failed: {ex}")
+            send_message({"message": text.rstrip(), "peer": peer})
+
+    def on_plugin_load(self):
+        self._log("Plugin loading started", "START")
+        self.add_on_send_message_hook()
+        self._log("Hooks registered", "START")
+        self._log("v3.5.8 ready (принудительный .stop)", "START")
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        try:
+            if not hasattr(params, 'message') or not isinstance(params.message, str):
+                return HookResult()
+
+            msg = params.message
+            stripped = msg.strip()
+
+            
+            bind_count = int(self.get_setting(self.BIND_COUNT_KEY, "0"))
+            for i in range(bind_count):
+                cmd_key = f"{self.BIND_CMD_PREFIX}{i}"
+                code_key = f"{self.BIND_CODE_PREFIX}{i}"
+                cmd = self.get_setting(cmd_key, "").strip()
+                if not cmd:
+                    continue
+                if stripped == cmd or stripped.startswith(cmd + " "):
+                    code = self.get_setting(code_key, "")
+                    if code.strip():
+                        self._log(f"Выполняется бинд: {cmd}")
+                        
+                        if stripped.startswith(cmd + " "):
+                            args_part = stripped[len(cmd) + 1:].strip()
+                        else:
+                            args_part = ""
+
+                        try:
+                            tokens_with_flags = self._parse_args(args_part)
+                        except ValueError:
+                            tokens_with_flags = []
+                            for token in args_part.split():
+                                tokens_with_flags.append((token, False))
+
+                        positional = []
+                        named = {}
+                        for token, is_quoted in tokens_with_flags:
+                            if not is_quoted and '=' in token:
+                                parts = token.split('=', 1)
+                                key = parts[0].strip()
+                                value = parts[1] if len(parts) > 1 else ''
+                                named[key] = self._parse_arg_value(value)
+                            else:
+                                positional.append(token)
+
+                        self.globals['args']     = positional
+                        for k in named:
+                            self.globals[k] = named[k]
+                        self.globals['argv']     = [cmd] + positional
+                        self.globals['sys'].argv = [cmd] + positional
+
+                        run_on_queue(lambda: self._execute_and_send(code.replace(chr(int(0x00A0)), " "), params.peer, account))
+                    return HookResult(strategy=HookStrategy.CANCEL)
+
+            
+            if stripped == ".stop":
+                self._log("Команда .stop получена")
+                peer = params.peer
+
+                self.stop_requested.set()
+
+                if self.input_wait_event:
+                    self.input_result = "[прервано командой .stop]"
+                    self.input_wait_event.set()
+                    self._log("input разблокирован с [прервано]")
+
+                if self.current_collector:
+                    self.current_collector = None
+
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            if self.input_wait_event:
+                input_value = None
+
+                if stripped == ".i" and hasattr(params, "replyToMsg") and params.replyToMsg is not None:
+                    try:
+                        mo = params.replyToMsg
+                        if hasattr(mo, "messageText") and mo.messageText:
+                            input_value = str(mo.messageText).replace(chr(int(0x00A0)), " ")
+                        elif (hasattr(mo, "messageOwner") and hasattr(mo.messageOwner, "message")):
+                            input_value = mo.messageOwner.message.replace(chr(int(0x00A0)), " ") or ""
+                        else:
+                            input_value = ""
+                        self._log(f"Input из ответа на сообщение: {input_value[:100]}...")
+                    except Exception as e:
+                        self._log(f"Ошибка получения текста ответа: {e}")
+                        input_value = ""
+
+                elif stripped.startswith(".i "):
+                    input_value = stripped[3:].strip()
+
+                if input_value is not None:
+                    self.input_result = input_value
+                    self.input_wait_event.set()
+                    self.input_wait_event = None
+                    return HookResult(strategy=HookStrategy.CANCEL)
+
+            if stripped.startswith('.p '):
+                self._log("Начало нового коллектора")
+                first_part = msg[len('.p '):] if msg.startswith('.p ') else stripped[3:]
+                self._start_new_collector(first_part, params.peer, account)
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            if self.current_collector is not None:
+                self._log(f"Добавление части кода (len={len(msg)})")
+                collector = self.current_collector
+                indent_size = collector['indent_size']
+                level = collector['indent_level']
+
+                if collector.get('prev_ends_with_colon', False):
+                    level += 1
+                    collector['indent_level'] = level
+
+                stripped_line = msg.lstrip(' \t')
+                new_line = ' ' * (level * indent_size) + stripped_line if stripped_line else msg
+
+                collector['code'] += '\n' + new_line
+                lines = new_line.splitlines()
+                collector['prev_ends_with_colon'] = bool(lines and lines[-1].rstrip().endswith(':'))
+
+                for line in reversed(lines):
+                    if line.strip():
+                        actual = len(line) - len(line.lstrip())
+                        collector['indent_level'] = max(0, actual // indent_size)
+                        break
+
+                collector['parts'] += 1
+                self._restart_timer()
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            return HookResult()
+        except Exception as e:
+            self._log(f"on_send_message_hook CRASH: {e}", "CRITICAL")
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+    def _start_new_collector(self, first_part: str, peer: Any, account: int):
+        self._log(f"Создание коллектора | len={len(first_part)}")
+        peer_id = None
+        try:
+            f = get_last_fragment()
+            if isinstance(f, ChatActivity):
+                peer_id = f.getDialogId()
+        except:
+            pass
+
+        pk = (account, peer_id) if peer_id is not None else (account, 0)
+        indent_size = self._detect_indent_size(first_part)
+
+        self.current_collector = {
+            'code': first_part.rstrip(),
+            'peer': peer,
+            'account': account,
+            'dialog_id': peer_id,
+            'parts': 1,
+            'pk': pk,
+            'timer': None,
+            'indent_size': indent_size,
+            'indent_level': 0,
+            'prev_ends_with_colon': first_part.rstrip().endswith(':')
+        }
+
+        lines = first_part.splitlines()
+        for line in reversed(lines):
+            if line.strip():
+                actual = len(line) - len(line.lstrip())
+                self.current_collector['indent_level'] = actual // indent_size
+                break
+
+        self._restart_timer()
+
+    def _restart_timer(self):
+        if self.current_collector and self.current_collector.get('timer'):
+            self.current_collector['timer'].cancel()
+        self.current_collector['timer'] = threading.Timer(
+            self.TIMER_SECONDS, self._execute_current_collector
+        )
+        self.current_collector['timer'].start()
+
+    def _execute_current_collector(self):
+        if self.current_collector is None:
+            return
+        collector = self.current_collector
+        self.current_collector = None
+        if collector.get('timer'):
+            collector['timer'].cancel()
+
+        code = collector['code']
+        code = code.replace(chr(int(0x00A0)), " ")
+        peer = collector['peer']
+        account = collector.get('account')
+        dialog_id = collector.get('dialog_id')
+
+        self._log(f"Запуск выполнения | частей={collector['parts']} | символов={len(code)}")
+        run_on_queue(lambda: self._execute_and_send(code, peer, account, dialog_id))
+
+    def _trace_stop(self, frame, event, arg):
+        if self.stop_requested.is_set():
+            raise SystemExit("Выполнение прервано")
+        return self._trace_stop
+
+    def _print_photo(self, image, caption="", peer=None):
+        
+        dialog_id = None
+        try:
+            f = get_last_fragment()
+            if isinstance(f, ChatActivity):
+                dialog_id = f.getDialogId()
+        except Exception as e:
+            self._log(f"get_last_fragment failed in print_photo: {e}")
+
+        if not dialog_id:
+            self._log("print_photo: не удалось определить текущий чат")
+            if peer:
+                BulletinHelper.show_error("print_photo: не удалось определить чат", peer)
+            return
+
+        try:
+            is_temp_file = False
+            file_path = None
+
+            if isinstance(image, str) and os.path.isfile(image):
+                file_path = image
+            else:
+                cache_dir = ApplicationLoader.applicationContext.getCacheDir().getAbsolutePath()
+                fd, file_path = tempfile.mkstemp(suffix='.png', prefix='pyexec_img_', dir=cache_dir)
+                os.close(fd)
+                is_temp_file = True
+
+                if isinstance(image, (bytes, bytearray)):
+                    with open(file_path, "wb") as f:
+                        f.write(image)
+                elif hasattr(image, 'save') and callable(image.save):
+                    image.save(file_path, format='PNG')
+                else:
+                    raise ValueError(f"Неподдерживаемый тип для print_photo: {type(image).__name__}")
+
+            if not file_path or not os.path.exists(file_path):
+                raise RuntimeError("Не удалось подготовить файл изображения")
+
+            send_photo(dialog_id, file_path, caption=caption or "")
+
+            self._log("print_photo: фото отправлено успешно")
+
+            if is_temp_file and os.path.exists(file_path):
+                try:
+                    os.unlink(file_path)
+                except:
+                    pass
+
+        except Exception as e:
+            self._log(f"print_photo ошибка: {e}")
+            if peer:
+                BulletinHelper.show_error(f"print_photo: {str(e)}", peer)
+
+    def _execute_and_send(self, code: str, peer: Any, account: int = None, dialog_id: int = None):
+        
+        with self.execution_lock:
+            if self.execution_thread is not None:
+                BulletinHelper.show_info(f"Предыдущий скрипт еще выполняется")
+                return
+
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        realtime_out = RealtimeStdout(peer, self._send_code_block, self)
+        sys.stdout = realtime_out
+        sys.stderr = realtime_out
+
+        old_trace = sys.gettrace()
+        
+        self.stop_requested.clear()
+
+        with self.execution_lock:
+            self.execution_thread = threading.current_thread()
+
+        def custom_input(prompt=""):
+            input_wrap = self.get_setting("input_wrap", "```PythonInputWaiting\n{text}```")
+            timeout = int(self.get_setting("input_timeout", "300"))
+            max_output_length = int(self.get_setting("max_output_length", "4000") or 4000)
+            if max_output_length:
+                if len(prompt) > max_output_length:
+                    prompt = prompt[:max_output_length] + "\n… [обрезано]"
+            if input_wrap:
+                parts = input_wrap.split("{text}", 1)
+                prompt_text = f"{parts[0]}{prompt}{parts[1]}" if prompt else input_wrap
+            else:
+                prompt_text = prompt if prompt else "."
+            self._send_code_block(prompt_text, peer)
+
+            event = threading.Event()
+            self.input_wait_event = event
+            
+            got_input = event.wait(timeout=timeout if timeout > 0 else None)
+
+            if not got_input:  
+                self.input_result = None
+                self.input_wait_event = None
+                raise TimeoutError("_")
+
+            value = self.input_result or ""
+            self.input_result = None
+            self.input_wait_event = None
+            return value
+
+        def print_photo(image, caption=""):
+            self._print_photo(image, caption, peer=peer)
+
+        self.globals['input'] = custom_input
+        self.globals['print_photo'] = print_photo
+
+        try:
+            sys.settrace(self._trace_stop)
+            exec(code, self.globals)
+            BulletinHelper.show_success(f"Код выполнен")
+        except SystemExit as e:
+            BulletinHelper.show_info(f"Скрипт остановлен")
+        except TimeoutError as e:   
+            BulletinHelper.show_info(f"Таймаут")
+        except Exception as e:
+            final_msg = str(e)
+            import traceback
+            import io
+    
+            tb_buffer = io.StringIO()
+            traceback.print_exc(file=tb_buffer)
+            final_msg = tb_buffer.getvalue()
+            
+            current_fragment = get_last_fragment()
+            if not current_fragment:
+                log("Cannot show dialog, no current fragment.")
+
+            activity = current_fragment.getParentActivity()
+            if not activity:
+                log("Cannot show dialog, no parent activity.")
+            
+            
+            
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Ошибка выполнения")
+            builder.set_message(final_msg)
+			
+            def on_positive_click(bld: AlertDialogBuilder, which: int):
+                bld.dismiss()
+			
+            builder.set_positive_button("OK", on_positive_click)
+			
+            builder.show()
+		
+                
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+            sys.settrace(old_trace)
+            with self.execution_lock:
+                self.execution_thread = None
+            if 'input' in self.globals:
+                del self.globals['input']
+            if 'print_photo' in self.globals:
+                del self.globals['print_photo']
+            self._init_globals()
+            realtime_out.flush()
+            
+        if self.get_setting("enable_logging", False):
+            self._flush_logs(peer)
+
+    def on_plugin_unload(self):
+        self._log("Plugin unloading")
+        
+        self.stop_requested.set()
+        if self.input_wait_event:
+            self.input_result = "[плагин выгружается]"
+            self.input_wait_event.set()
+        if self.current_collector and self.current_collector.get('timer'):
+            self.current_collector['timer'].cancel()
+        self.current_collector = None
+
+        with self.execution_lock:
+            thread = self.execution_thread
+        if thread and thread is not threading.current_thread():
+            thread.join(1.0)
+
+    def _reload_plugin(self):
+        self._log("Перезагрузка плагина...")
+        
+        self.stop_requested.set()
+        
+        if self.input_wait_event:
+            self.input_result = "[плагин перезагружается]"
+            self.input_wait_event.set()
+        
+        if self.current_collector:
+            self.current_collector = None
+
+        with self.execution_lock:
+            thread = self.execution_thread
+        if thread and thread is not threading.current_thread():
+            thread.join(2.0)
+            if thread.is_alive():
+                self._log("⚠️ Поток выполнения не завершился, продолжаем перезагрузку")
+
+        
+        self.on_plugin_unload()
+        self.on_plugin_load()
+
+        
+        run_on_ui_thread(lambda: BulletinHelper.show_simple("Плагин перезагружен"))
+        self._log("Плагин успешно перезагружен")
+
+    def _add_new_bind(self, view=None):
+        count = int(self.get_setting(self.BIND_COUNT_KEY, "0"))
+        new_index = count
+        BulletinHelper.show_info(f"Бинд {new_index+1} добавлен")
+        self.set_setting(f"{self.BIND_CMD_PREFIX}{new_index}", f".bind{new_index+1}", reload_settings=False)
+        self.set_setting(f"{self.BIND_CODE_PREFIX}{new_index}", """print("Hello World")""", reload_settings=False)
+        self.set_setting(self.BIND_COUNT_KEY, str(count + 1), reload_settings=True)
+
+
+    def _delete_bind(self, index: int, view=None):
+        count = int(self.get_setting(self.BIND_COUNT_KEY, "0"))
+        if not (0 <= index < count):
+            return
+        
+        for i in range(index, count - 1):
+            cmd = self.get_setting(f"{self.BIND_CMD_PREFIX}{i+1}", "")
+            code = self.get_setting(f"{self.BIND_CODE_PREFIX}{i+1}", "")
+            self.set_setting(f"{self.BIND_CMD_PREFIX}{i}", cmd, reload_settings=False)
+            self.set_setting(f"{self.BIND_CODE_PREFIX}{i}", code, reload_settings=False)
+
+        last = count - 1
+        self.set_setting(f"{self.BIND_CMD_PREFIX}{last}", "", reload_settings=False)
+        self.set_setting(f"{self.BIND_CODE_PREFIX}{last}", "", reload_settings=False)
+        self.set_setting(self.BIND_COUNT_KEY, str(count - 1), reload_settings=True)
+
+        BulletinHelper.show_info("Бинд удалён")
+
+    def create_settings(self) -> List[Any]:
+        settings = [
+            Divider("Никому кароч это ну там короче жта ну ты пон и этот чат самая большая политическая арена типа лол как бы да бош я глотаю сперму я гей я гей я гей я гей я гей я гей я гей ебити миня в заад ох ох ох 卐⁠!онлифанс"),
+            Header(text="Плагин"),
+            Input(
+                key="max_output_length",
+                text="Максимальная длина вывода",
+                default="4000",
+                subtext="В символах, 0 = не обрезать"
+            ),
+            Header(text="print()"),
+            Input(
+                key="output_wrap",
+                text="Формат отображения вывода",
+                default="```PythonOutput\n{text}```"
+            ),
+            Header(text="input()"),
+            Input(
+                key="input_wrap",
+                text="Формат отображения ожидания ввода",
+                default="```PythonInputWaiting\n{text}```"
+            ),
+            Input(
+                key="input_timeout",
+                text="время ожидания input()",
+                default="300",
+                subtext="В секундах, 0 = вечно"
+            ),
+            Divider(),
+            Header(text="Остальное"),
+#            Switch(
+#                key="enable_logging",
+#                text="Включить отладочные логи",
+#                default=False,
+#                subtext="Логи отправляются при ошибках и по .stop"
+#            ),
+#            Input(
+#                key="max_log_length",
+#                text="Максимальная длина сообщения с логами",
+#                default="4000",
+#                subtext="В символах, 0 = не обрезать"
+#            ),
+            Text(
+                text="Перезагрузить плагин",
+                red=True,
+                on_click=lambda view: self._reload_plugin()
+            ),
+
+            Header(text="Бинды для кода"),
+            Text(
+                text="Добавить бинд",
+                icon="menu_passkey_add",
+                accent=True,
+                on_click=self._add_new_bind
+            ),
+            Divider()
+        ]
+
+        count = int(self.get_setting(self.BIND_COUNT_KEY, "0"))
+
+        for i in range(count):
+            cmd_key = f"{self.BIND_CMD_PREFIX}{i}"
+            code_key = f"{self.BIND_CODE_PREFIX}{i}"
+
+            cmd = self.get_setting(cmd_key, f".cmd{i}")
+            code = self.get_setting(code_key, "")
+            code_preview = (code[:60] + "...") if len(code) > 60 else code
+
+            settings.extend([
+                Header(text=f"Бинд #{i+1} — {cmd}"),
+                Input(
+                    key=cmd_key,
+                    text="Команда",
+                    default=cmd,
+                    subtext="пример: .test"
+                ),
+                Input(
+                    key=code_key,
+                    text="Код",
+                    default="""print("world")""",
+                    
+                ),
+                Text(
+                    text="Удалить",
+                    icon="msg_delete_filled",
+                    red=True,
+                    on_click=partial(self._delete_bind, i)
+                ),
+                Divider()
+            ])
+
+        return settings
